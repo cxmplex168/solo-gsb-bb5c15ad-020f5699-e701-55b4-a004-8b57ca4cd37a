@@ -33,6 +33,11 @@ docker compose up --build
 同一事务写入。无需手工执行任何迁移命令，`docker compose up --build` 一条指令即
 完成建库与迁移。
 
+此外，**修复前保存的线性记录**（端点切口的末端类型/突出端未写入首/末片段的旧
+结果）在每次**读取时**依据已存切口自动校正片段末端——校正只发生在内存中，
+不重算识别位点、不改写数据库，因此历史记录的连接兼容性、拼接链等所有读取
+路径都使用正确末端（规则详见[坐标与末端约定](#坐标与末端约定)的线性序列条目）。
+
 其它常用 Docker 操作：
 
 ```bash
@@ -378,7 +383,8 @@ curl -X POST http://localhost:8000/digests/1/partial-digest-distribution \
   服务以 `math.fsum` 精确累加，**与 1 的误差远小于 1e-9**。
 - **稳定排序**：先按 `probability` 降序；概率相同的按长度多重集字典序排序，
   相同请求（无论 `cuts` 条目顺序）结果必然一致。概率为 0 的不可能结果不返回。
-- **拓扑规则与完整酶切完全一致**：线性分子的端点切口不产生新边界；环形分子
+- **拓扑规则与完整酶切完全一致**：线性分子的端点切口不产生新边界（其末端
+  类型与突出端序列写入端部片段，切口未成功时恢复天然 `none`）；环形分子
   按唯一 `top_cut` 归并边界，单一边界开环为 1 条全长片段、无切口保留整条环
   （因此环形分子的"无切口"、"恰好一个切口成功"与"成功的切口共用同一正链
   坐标"都会合并到同一长度多重集 `[L]`）。
@@ -500,7 +506,9 @@ curl -X POST http://localhost:8000/digests/1/methylation-analysis \
   其中 `enzymes` / `sites` 已按存活位点**重新合并去重**。
 - `removed_cuts[]`：全部位点均被阻断而消失的物理切口，回显阻断前的完整切口对象。
 - `fragments[]`：由保留切口复用完整酶切的片段逻辑重建，线性端点切口、环形单切口
-  开环、无切口保留整条环等规则与 `POST /digests` 完全一致。
+  开环、无切口保留整条环等规则与 `POST /digests` 完全一致——保留的线性端点切口
+  仍把末端类型与突出端写入端部片段，而被阻断移除的端点切口使相应片段末端恢复为
+  天然 `none`。
 - **稳定排序**：`retained_cuts` / `removed_cuts` 按 `(top_cut, bottom_cut)` 排序；
   `blocked_sites` 按 `(top_cut, bottom_cut, 酶名, 起点, 链)` 排序；片段按起点排序。
   相同请求（无论列表条目顺序）结果必然一致。
@@ -519,6 +527,8 @@ curl -X POST http://localhost:8000/digests/1/methylation-analysis \
 
 
 
+## 坐标与末端约定
+
 - **坐标**：均为 0-based，作用于 top 链（提交序列方向）；切口位置 `c` 表示断裂
   位于第 `c-1` 与第 `c` 个碱基之间。片段区间为半开区间 `[start, end)`。
 - **末端类型 `end_type` / `left_end.type` / `right_end.type`**：
@@ -527,6 +537,17 @@ curl -X POST http://localhost:8000/digests/1/methylation-analysis \
   - `none`：线性分子的天然末端，或未切割的完整分子。
 - **`overhang`**：突出端序列，按 top 链 5'→3' 方向取自两切口之间的区段；
   平端与 `none` 时为空字符串。
+- **线性序列**：n 个内部切口产生 n+1 个片段。**端点切口**——正链切口位于
+  分子端点（`top_cut` 为 0 或序列长度 L）——不产生新边界、不增加片段数，
+  但该切口的末端类型与突出端序列会写入首片段左端（`top_cut == 0`）或末片段
+  右端（`top_cut == L`）：例如线性 `AAGCCCC` 上模式 `AAG`、`cut_top=0`、
+  `cut_bottom=1` 的切口 `(0,1)` 使唯一片段的左端为 `5prime`/`A` 而非 `none`，
+  连接兼容性与拼接链因此能把该端作为黏端参与配对。没有端点切口时端部片段
+  保持 `none`；同一端点的多个切口沿用稳定切口顺序（`(top_cut, bottom_cut)`
+  升序）中的第一条。修复前保存的线性记录在**读取时**依据已存切口自动校正
+  片段末端（不重算位点、不改写数据库），因此历史记录的连接兼容性、拼接链
+  等所有读取路径同样使用正确末端；甲基化阻断端点切口后，相应片段末端恢复
+  为天然 `none`。
 - **环形序列**：切口位置对序列长度取模；`wraps_origin: true` 表示该片段跨越
   首尾原点，其 `end` 为取模后的坐标（可能小于 `start`）。片段边界按唯一
   `top_cut` 归并——多个物理切口共用同一正链坐标时只产生一个断裂点，该边界的
@@ -1229,7 +1250,7 @@ curl -X POST http://localhost:8000/digest-identification \
 ```
 app/
 ├── main.py      # FastAPI 入口与路由
-├── digest.py    # 酶切核心算法（搜索、去重、片段生成）
+├── digest.py    # 酶切核心算法（搜索、去重、片段生成、线性端点切口末端与读取校正）
 ├── variant.py   # 变异施加与切口/片段差异对比
 ├── panel.py     # 酶组合面板规划（枚举候选组合、最少酶择优）
 ├── distribution.py  # 部分酶切概率分布（枚举成功/失败状态、长度多重集合并）
@@ -1243,10 +1264,11 @@ app/
 ├── identification.py # 未知样本识别（观测/预期片段一对一最优配对、字典序择优、命中/歧义判定）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
-└── db.py        # SQLite 持久化（启动时自动建表；旧版库可重复迁移并回填 cut_count / fragment_count 摘要列）
+└── db.py        # SQLite 持久化（启动时自动建表；旧版库可重复迁移并回填 cut_count / fragment_count 摘要列；读取时校正修复前线性的端点末端）
 tests/
 ├── test_digest.py       # 酶切算法测试
 ├── test_api.py          # 提交/查询/校验 API 测试
+├── test_linear_endpoint_api.py  # 线性端点切口末端规则与读取校正测试
 ├── test_variant_api.py  # 变异影响分析 API 测试
 ├── test_panel_api.py    # 酶组合面板规划 API 测试
 ├── test_distribution_api.py  # 部分酶切概率分布 API 测试

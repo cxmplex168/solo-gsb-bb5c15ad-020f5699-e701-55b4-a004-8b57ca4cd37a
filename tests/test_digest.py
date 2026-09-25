@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.digest import CutConflictError, run_digest
+from app.digest import CutConflictError, repair_linear_fragment_ends, run_digest
 from app.iupac import reverse_complement
 
 
@@ -293,6 +293,153 @@ def test_no_cut_keeps_whole_molecule():
         assert frag["sequence"] == seq
         assert frag["left_end"]["type"] == "none"
         assert frag["right_end"]["type"] == "none"
+
+
+# ---------- 线性端点切口 ----------
+
+
+def test_linear_endpoint_cut_at_origin_writes_left_end():
+    # AAGCCCC 上模式 AAG、cut_top=0、cut_bottom=1：正链切口位于 0
+    # （分子端点），不产生新边界，但 5' 突出端 A 必须写入唯一片段左端
+    enz = FakeEnzyme("End5", "AAG", 0, 1)
+    result = run_digest("AAGCCCC", "linear", [enz])
+    assert len(result["cuts"]) == 1
+    cut = result["cuts"][0]
+    assert (cut["top_cut"], cut["bottom_cut"]) == (0, 1)
+    assert cut["end_type"] == "5prime"
+    assert cut["overhang"] == "A"
+    frags = result["fragments"]
+    assert len(frags) == 1  # 端点切口不增加片段数
+    frag = frags[0]
+    assert (frag["start"], frag["end"], frag["length"]) == (0, 7, 7)
+    assert frag["sequence"] == "AAGCCCC"
+    assert frag["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frag["right_end"] == {"type": "none", "overhang": ""}
+
+
+def test_linear_endpoint_cut_at_length_writes_right_end():
+    # AAGCCC 上模式 CCC、cut_top=3、cut_bottom=2：切口 (6,5) 的正链
+    # 位置恰为序列长度，3' 突出端 C 写入唯一片段右端
+    enz = FakeEnzyme("End3", "CCC", 3, 2)
+    result = run_digest("AAGCCC", "linear", [enz])
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [(6, 5)]
+    frags = result["fragments"]
+    assert len(frags) == 1
+    assert frags[0]["left_end"] == {"type": "none", "overhang": ""}
+    assert frags[0]["right_end"] == {"type": "3prime", "overhang": "C"}
+
+
+def test_linear_both_endpoint_cuts():
+    # 两个端点切口分别写入同一唯一片段的左、右端
+    e5 = FakeEnzyme("End5", "AAG", 0, 1)  # (0,1) 5prime/A
+    e3 = FakeEnzyme("End3", "CCC", 3, 2)  # (6,5) 3prime/C
+    result = run_digest("AAGCCC", "linear", [e5, e3])
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [(0, 1), (6, 5)]
+    frag = result["fragments"][0]
+    assert frag["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frag["right_end"] == {"type": "3prime", "overhang": "C"}
+
+
+def test_linear_endpoint_cut_with_internal_cuts():
+    # 端点切口与内部切口并存：端点写入端部片段，内部边界照常切分
+    e5 = FakeEnzyme("End5", "AAG", 0, 1)  # (0,1) 与内部切口 (3,4)
+    e3 = FakeEnzyme("End3", "CCC", 3, 2)  # (9,8) 端点
+    result = run_digest("AAGAAGCCC", "linear", [e5, e3])
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [
+        (0, 1), (3, 4), (9, 8),
+    ]
+    frags = result["fragments"]
+    assert [f["length"] for f in frags] == [3, 6]
+    assert frags[0]["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frags[0]["right_end"] == {"type": "5prime", "overhang": "A"}
+    assert frags[1]["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frags[1]["right_end"] == {"type": "3prime", "overhang": "C"}
+
+
+def test_linear_blunt_endpoint_cut():
+    # 端点平端切口同样写入片段末端（blunt，突出端为空）
+    enz = FakeEnzyme("EndB", "AAG", 0, 0)
+    result = run_digest("AAGCCCC", "linear", [enz])
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [(0, 0)]
+    frag = result["fragments"][0]
+    assert frag["left_end"] == {"type": "blunt", "overhang": ""}
+    assert frag["right_end"] == {"type": "none", "overhang": ""}
+
+
+def test_linear_shared_endpoint_cut_stable_order():
+    # 同一端点的多个切口：沿用稳定切口顺序（(top, bottom) 升序）第一条，
+    # 与酶传入顺序无关——(0,0) blunt 先于 (0,1) 5prime
+    blunt = FakeEnzyme("EndB", "AAG", 0, 0)
+    sticky = FakeEnzyme("End5", "AAG", 0, 1)
+    for enzymes in ([blunt, sticky], [sticky, blunt]):
+        result = run_digest("AAGCCCC", "linear", enzymes)
+        assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [(0, 0), (0, 1)]
+        frag = result["fragments"][0]
+        assert frag["left_end"] == {"type": "blunt", "overhang": ""}
+        assert frag["right_end"] == {"type": "none", "overhang": ""}
+
+
+def test_linear_no_endpoint_cut_keeps_none_ends():
+    # 切口全部位于内部：首/末片段的天然末端保持 none
+    result = run_digest("AAAAGAATTCTTTT", "linear", [ECORI])
+    assert result["fragments"][0]["left_end"]["type"] == "none"
+    assert result["fragments"][-1]["right_end"]["type"] == "none"
+
+
+# ---------- 修复前记录的读取校正 ----------
+
+
+def _legacy_result(sequence, enzymes):
+    """模拟修复前落库的线性结果：端点切口存在，但片段端点末端丢失为 none。"""
+    result = run_digest(sequence, "linear", enzymes)
+    for frag in result["fragments"]:
+        frag["left_end"] = {"type": "none", "overhang": ""}
+        frag["right_end"] = {"type": "none", "overhang": ""}
+    return result
+
+
+def test_repair_linear_fragment_ends_restores_terminal_overhang():
+    legacy = _legacy_result("AAGCCCC", [FakeEnzyme("End5", "AAG", 0, 1)])
+    assert legacy["fragments"][0]["left_end"] == {"type": "none", "overhang": ""}
+    repaired = repair_linear_fragment_ends(legacy, 7)
+    frag = repaired["fragments"][0]
+    assert frag["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frag["right_end"] == {"type": "none", "overhang": ""}
+    # 切口列表不被改动
+    assert repaired["cuts"] == legacy["cuts"]
+
+
+def test_repair_linear_fragment_ends_both_ends_and_stable_order():
+    e5 = FakeEnzyme("End5", "AAG", 0, 1)
+    e3 = FakeEnzyme("End3", "CCC", 3, 2)
+    eb = FakeEnzyme("EndB", "AAG", 0, 0)
+    legacy = _legacy_result("AAGCCC", [e5, e3])
+    repaired = repair_linear_fragment_ends(legacy, 6)
+    frag = repaired["fragments"][0]
+    assert frag["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frag["right_end"] == {"type": "3prime", "overhang": "C"}
+    # 同一端点多个切口：取稳定顺序第一条（(0,0) blunt 先于 (0,1)）
+    legacy2 = _legacy_result("AAGCCCC", [e5, eb])
+    repaired2 = repair_linear_fragment_ends(legacy2, 7)
+    assert repaired2["fragments"][0]["left_end"] == {"type": "blunt", "overhang": ""}
+
+
+def test_repair_linear_fragment_ends_idempotent_and_conservative():
+    # 对修复后的结果重复校正得到相同末端（幂等）
+    fresh = run_digest("AAGCCC", "linear", [FakeEnzyme("End3", "CCC", 3, 2)])
+    snapshot = [dict(f) for f in fresh["fragments"]]
+    repair_linear_fragment_ends(fresh, 6)
+    assert fresh["fragments"] == snapshot
+    # 没有端点切口时保留原末端，不做任何改动
+    result = run_digest("AAAAGAATTCTTTT", "linear", [ECORI])
+    before = [dict(f) for f in result["fragments"]]
+    repair_linear_fragment_ends(result, 14)
+    assert result["fragments"] == before
+    # 空结果安全通过
+    assert repair_linear_fragment_ends({"cuts": [], "fragments": []}, 5) == {
+        "cuts": [],
+        "fragments": [],
+    }
 
 
 def test_multiple_enzymes_combined():
