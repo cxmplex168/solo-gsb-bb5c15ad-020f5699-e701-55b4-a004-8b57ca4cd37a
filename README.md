@@ -184,6 +184,58 @@ curl -X POST http://localhost:8000/digests \
 含冲突坐标的 422，只读分析不改动原记录。取模后同坐标且末端一致的合法位点
 不受影响，仍照常合并酶与位点。
 
+## 线性端点切口规则
+
+线性分子上正链切口位于**分子端点**（`top_cut` 为 `0` 或序列长度 `L`）时
+**不产生新边界、不增加片段**，但该切口并不会被丢弃：其末端类型与突出端
+序列写入**首片段左端**（`top_cut == 0`）或**末片段右端**
+（`top_cut == L`）——端点切口同样使分子末端成为真实切割末端，末端连接
+兼容性分析与片段拼接链规划都能正确使用这些末端。
+
+- 没有端点切口时，分子两端保持天然末端 `none`（既有行为不变）；
+- 多个切口共用同一端点时，沿用稳定切口顺序（`(top_cut, bottom_cut)`
+  升序）中的**第一条**；
+- 甲基化分析阻断并移除端点切口后，相应分子末端恢复为天然末端 `none`；
+  切口被保留时则携带其黏端/平端末端；
+- **修复前保存的线性记录**：读取完整记录（`GET /digests/{id}` 以及连接、
+  拼接等只读分析）时依据**已存切口**在内存中校正片段末端，不重算位点、
+  不改写数据库——历史记录无需任何手工迁移即可获得正确末端。
+
+示例：线性序列 `AAGCCCC` 配模式 `AAG`、`cut_top=0`、`cut_bottom=1`，
+切口 `(0,1)` 位于左端点，切口报告 5' 突出端 `A`；唯一片段 `[0,7)` 的
+`left_end` 为 `{"type": "5prime", "overhang": "A"}`，`right_end`
+保持 `none`：
+
+```bash
+curl -X POST http://localhost:8000/digests \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sequence": "AAGCCCC",
+    "topology": "linear",
+    "enzymes": [
+      {"name": "End5", "pattern": "AAG", "cut_top": 0, "cut_bottom": 1}
+    ]
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "cuts": [
+    {"top_cut": 0, "bottom_cut": 1, "end_type": "5prime", "overhang": "A",
+     "enzymes": ["End5"],
+     "sites": [{"enzyme": "End5", "start": 0, "strand": "+", "matched": "AAG"}]}
+  ],
+  "fragments": [
+    {"index": 0, "start": 0, "end": 7, "length": 7, "sequence": "AAGCCCC",
+     "wraps_origin": false,
+     "left_end": {"type": "5prime", "overhang": "A"},
+     "right_end": {"type": "none", "overhang": ""}}
+  ]
+}
+```
+
 ## 变异影响分析
 
 对已保存的酶切记录施加一组 **0-based 单碱基替换**，在**内存中**用变异后序列
@@ -525,6 +577,8 @@ curl -X POST http://localhost:8000/digests/1/methylation-analysis \
   - `blunt`：平端（正/反链切口位置相同）；
   - `5prime`：5' 黏端；`3prime`：3' 黏端；
   - `none`：线性分子的天然末端，或未切割的完整分子。
+  - 线性分子端点处的切口不产生新边界，但其末端类型与突出端写入首片段
+    左端 / 末片段右端（见[线性端点切口规则](#线性端点切口规则)）。
 - **`overhang`**：突出端序列，按 top 链 5'→3' 方向取自两切口之间的区段；
   平端与 `none` 时为空字符串。
 - **环形序列**：切口位置对序列长度取模；`wraps_origin: true` 表示该片段跨越
@@ -1243,10 +1297,12 @@ app/
 ├── identification.py # 未知样本识别（观测/预期片段一对一最优配对、字典序择优、命中/歧义判定）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
-└── db.py        # SQLite 持久化（启动时自动建表；旧版库可重复迁移并回填 cut_count / fragment_count 摘要列）
+└── db.py        # SQLite 持久化（启动时自动建表；旧版库可重复迁移并回填 cut_count / fragment_count 摘要列；
+                 # 读取线性记录时依据已存切口在内存中校正端点末端，不改写数据库）
 tests/
 ├── test_digest.py       # 酶切算法测试
 ├── test_api.py          # 提交/查询/校验 API 测试
+├── test_linear_endpoint_api.py  # 线性端点切口末端规则与旧记录读取校正 API 测试
 ├── test_variant_api.py  # 变异影响分析 API 测试
 ├── test_panel_api.py    # 酶组合面板规划 API 测试
 ├── test_distribution_api.py  # 部分酶切概率分布 API 测试

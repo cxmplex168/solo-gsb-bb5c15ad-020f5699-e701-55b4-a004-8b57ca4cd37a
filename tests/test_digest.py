@@ -295,6 +295,91 @@ def test_no_cut_keeps_whole_molecule():
         assert frag["right_end"]["type"] == "none"
 
 
+def test_linear_endpoint_cut_at_zero_sets_left_end():
+    # 切口 (0,1) 位于分子左端点：不产生新边界，但首片段左端携带
+    # 该切口的 5' 突出端 A，而不是天然末端 none
+    enz = FakeEnzyme("End5", "AAG", 0, 1)
+    result = run_digest("AAGCCCC", "linear", [enz])
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [(0, 1)]
+    cut = result["cuts"][0]
+    assert cut["end_type"] == "5prime"
+    assert cut["overhang"] == "A"
+    frags = result["fragments"]
+    assert len(frags) == 1  # 端点切口不增加片段
+    frag = frags[0]
+    assert (frag["start"], frag["end"], frag["length"]) == (0, 7, 7)
+    assert frag["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frag["right_end"] == {"type": "none", "overhang": ""}
+
+
+def test_linear_endpoint_cut_at_length_sets_right_end():
+    # 切口 top_cut == L 位于分子右端点：末片段右端携带该切口的 3' 突出端
+    enz = FakeEnzyme("End3", "AAG", 3, 2)  # 位点起于 4，切口 (7,6)
+    result = run_digest("CCCCAAG", "linear", [enz])
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [(7, 6)]
+    cut = result["cuts"][0]
+    assert cut["end_type"] == "3prime"
+    assert cut["overhang"] == "G"
+    frags = result["fragments"]
+    assert len(frags) == 1
+    assert frags[0]["left_end"] == {"type": "none", "overhang": ""}
+    assert frags[0]["right_end"] == {"type": "3prime", "overhang": "G"}
+
+
+def test_linear_endpoint_cuts_at_both_ends():
+    # 左右端点同时有切口：首片段左端与末片段右端分别携带各自切口末端
+    left = FakeEnzyme("LeftEnd", "AAG", 0, 1)  # 切口 (0,1)：5prime A
+    right = FakeEnzyme("RightEnd", "CCC", 3, 3)  # 切口 (6,6) 与端点切口 (7,7)：blunt
+    result = run_digest("AAGCCCC", "linear", [left, right])
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [
+        (0, 1),
+        (6, 6),
+        (7, 7),
+    ]
+    frags = result["fragments"]
+    assert [f["length"] for f in frags] == [6, 1]  # 端点切口不增加片段
+    assert frags[0]["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frags[0]["right_end"] == {"type": "blunt", "overhang": ""}
+    assert frags[1]["left_end"] == {"type": "blunt", "overhang": ""}
+    assert frags[1]["right_end"] == {"type": "blunt", "overhang": ""}
+
+
+def test_linear_endpoint_cut_with_internal_cut():
+    # 端点切口与内部切口共存：端点末端写入首片段，内部边界照常
+    end5 = FakeEnzyme("End5", "AAG", 0, 1)  # 切口 (0,1)
+    result = run_digest("AAGCCCCGAATTC", "linear", [end5, ECORI])  # EcoRI 切口 (8,12)
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [(0, 1), (8, 12)]
+    frags = result["fragments"]
+    assert [f["length"] for f in frags] == [8, 5]
+    assert frags[0]["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frags[0]["right_end"] == {"type": "5prime", "overhang": "AATT"}
+    assert frags[1]["left_end"] == {"type": "5prime", "overhang": "AATT"}
+    assert frags[1]["right_end"] == {"type": "none", "overhang": ""}
+
+
+def test_linear_shared_endpoint_cut_stable_order():
+    # 多个切口共用同一端点：沿用稳定切口顺序（(top_cut, bottom_cut) 升序）
+    # 的第一条——(0,1) 5prime A 先于 (0,2) 5prime AA，与酶传入顺序无关
+    e1 = FakeEnzyme("E1", "AAG", 0, 2)
+    e2 = FakeEnzyme("E2", "AAG", 0, 1)
+    result = run_digest("AAGCCCC", "linear", [e1, e2])
+    assert [(c["top_cut"], c["bottom_cut"]) for c in result["cuts"]] == [(0, 1), (0, 2)]
+    assert len(result["fragments"]) == 1
+    frag = result["fragments"][0]
+    assert frag["left_end"] == {"type": "5prime", "overhang": "A"}
+    assert frag["right_end"] == {"type": "none", "overhang": ""}
+    # 调换酶传入顺序结果一致
+    again = run_digest("AAGCCCC", "linear", [e2, e1])
+    assert again == result
+
+
+def test_linear_no_endpoint_cut_keeps_none_ends():
+    # 切口不在端点时，分子两端保持天然末端 none（既有行为不变）
+    result = run_digest("AAAAGAATTCTTTT", "linear", [ECORI])
+    assert result["fragments"][0]["left_end"]["type"] == "none"
+    assert result["fragments"][1]["right_end"]["type"] == "none"
+
+
 def test_multiple_enzymes_combined():
     seq = "GAATTC" + "AAAA" + "GATATC" + "TTTT"  # EcoRI@0, EcoRV@10
     result = run_digest(seq, "linear", [ECORI, ECORV])

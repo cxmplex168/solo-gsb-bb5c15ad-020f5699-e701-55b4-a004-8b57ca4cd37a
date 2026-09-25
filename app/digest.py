@@ -26,6 +26,8 @@
 * top_cut <  bottom_cut        -> 5prime（5' 突出端），突出序列 = top 链 [top, bottom) 区段
 * top_cut >  bottom_cut        -> 3prime（3' 突出端），突出序列 = top 链 [bottom, top) 区段
 * 线性分子的天然末端 / 未切割的完整分子 -> none
+  （线性分子端点处的切口不产生新边界，但其末端类型与突出端会写入
+  首片段左端 / 末片段右端，见 build_fragments）
 """
 
 from __future__ import annotations
@@ -212,8 +214,12 @@ def _end_dict(cut: dict | None) -> dict:
 def build_fragments(sequence: str, topology: str, cuts: list[dict]) -> list[dict]:
     """按拓扑结构由切口生成片段。
 
-    * 线性：n 个有效切口产生 n+1 个片段；位于分子端点 (0 或 L) 的
-      切口不产生新边界。
+    * 线性：n 个有效切口产生 n+1 个片段；正链切口位于分子端点
+      （top_cut 为 0 或 L）时不产生新边界，但该切口的末端类型与
+      突出端写入首片段左端（top_cut == 0）或末片段右端
+      （top_cut == L）——端点切口同样使分子末端成为真实切割末端；
+      同一端点的多个切口沿用稳定切口顺序（(top_cut, bottom_cut)
+      升序）取第一条；没有端点切口时分子末端保持 none。
     * 环形：片段边界按唯一 top_cut 归并——多个物理切口共用同一正链
       坐标时只产生一个断裂点，该边界的末端信息取稳定切口顺序
       （(top_cut, bottom_cut) 升序）中的第一条。n 个唯一边界产生
@@ -275,6 +281,18 @@ def build_fragments(sequence: str, topology: str, cuts: list[dict]) -> list[dict
             pos = cut["top_cut"]
             if 0 < pos < length and pos not in events_by_pos:
                 events_by_pos[pos] = cut
+        # 端点切口（top_cut 为 0 或 L）不产生新边界，但分子末端不再是
+        # 天然末端：top_cut == 0 的切口决定首片段左端，top_cut == L 的
+        # 切口决定末片段右端；同一端点的多个切口沿用稳定切口顺序取第一条
+        left_end_cut = right_end_cut = None
+        for cut in cuts:
+            pos = cut["top_cut"]
+            if pos == 0:
+                if left_end_cut is None:
+                    left_end_cut = cut
+            elif pos == length:
+                if right_end_cut is None:
+                    right_end_cut = cut
         points = [0] + sorted(events_by_pos) + [length]
         for i in range(len(points) - 1):
             s, e = points[i], points[i + 1]
@@ -285,14 +303,46 @@ def build_fragments(sequence: str, topology: str, cuts: list[dict]) -> list[dict
                     "length": e - s,
                     "sequence": sequence[s:e],
                     "wraps_origin": False,
-                    "left_end": _end_dict(events_by_pos.get(s)),
-                    "right_end": _end_dict(events_by_pos.get(e)),
+                    "left_end": _end_dict(
+                        left_end_cut if s == 0 else events_by_pos.get(s)
+                    ),
+                    "right_end": _end_dict(
+                        right_end_cut if e == length else events_by_pos.get(e)
+                    ),
                 }
             )
 
     return [
         {"index": i, **frag} for i, frag in enumerate(fragments)
     ]
+
+
+def repair_linear_fragment_ends(result: dict, length: int) -> None:
+    """就地校正线性结果的分子端点末端（读取修复前记录时的内存修复）。
+
+    修复前保存的线性记录丢弃了端点切口（top_cut 为 0 或 L）的末端信息，
+    首片段左端 / 末片段右端恒为 none，连接分析因此漏报可连接末端。
+    本函数依据**已存切口**按 build_fragments 的相同规则补写这两个末端：
+    不重算位点、不改写数据库；对修复后保存的记录幂等（重复执行结果
+    不变）。环形记录的切口坐标全部取模归一化、无此问题，不应传入。
+    """
+    fragments = result.get("fragments")
+    cuts = result.get("cuts")
+    if not fragments or not cuts:
+        return
+    left_end_cut = right_end_cut = None
+    for cut in cuts:  # 已存切口按 (top_cut, bottom_cut) 排序，同端点取第一条
+        pos = cut.get("top_cut")
+        if pos == 0:
+            if left_end_cut is None:
+                left_end_cut = cut
+        elif pos == length:
+            if right_end_cut is None:
+                right_end_cut = cut
+    if left_end_cut is not None:
+        fragments[0]["left_end"] = _end_dict(left_end_cut)
+    if right_end_cut is not None:
+        fragments[-1]["right_end"] = _end_dict(right_end_cut)
 
 
 def run_digest(sequence: str, topology: str, enzymes) -> dict:

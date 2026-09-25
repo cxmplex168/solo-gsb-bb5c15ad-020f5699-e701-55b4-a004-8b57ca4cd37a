@@ -8,6 +8,11 @@ results 表除完整结果 result_json 外，另持久化摘要列 cut_count /
 fragment_count：GET /digests 列表只读摘要列，不再逐条加载、解析
 完整结果。启动时对旧版库执行**可重复迁移**（缺列则 ALTER 补列、
 NULL 行由 result_json 回填），重复执行不会重复改动或回填。
+
+读取完整记录时（get_submission），对修复前保存的**线性**记录在内存中
+依据已存切口校正分子端点末端（digest.repair_linear_fragment_ends）：
+端点切口（top_cut 为 0 或 L）的末端类型与突出端曾未被写入首片段左端 /
+末片段右端。校正只作用于返回值，不重算位点、不改写数据库。
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timezone
+
+from .digest import repair_linear_fragment_ends
 
 # 全新建库时的表结构：摘要列直接随表创建。
 SCHEMA = """
@@ -162,13 +169,18 @@ class Database:
                 "SELECT result_json FROM results WHERE submission_id = ?",
                 (submission_id,),
             ).fetchone()
+        parsed = json.loads(result["result_json"])
+        if sub["topology"] == "linear":
+            # 修复前保存的线性记录可能漏写端点切口的末端信息：读取时
+            # 依据已存切口在内存中校正片段末端，数据库内容保持不变
+            repair_linear_fragment_ends(parsed, len(sub["sequence"]))
         return {
             "id": sub["id"],
             "sequence": sub["sequence"],
             "topology": sub["topology"],
             "created_at": sub["created_at"],
             "enzymes": [dict(e) for e in enzymes],
-            "result": json.loads(result["result_json"]),
+            "result": parsed,
         }
 
     def list_submissions(self) -> list[dict]:
